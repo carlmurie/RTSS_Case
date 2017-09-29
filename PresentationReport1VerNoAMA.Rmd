@@ -1,0 +1,1115 @@
+---
+title: "RTSS Project Report"
+subtitle: "Presentation of vaccine and disease interactions"
+author: "Carl Murie and Raphael Gottardo"
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+autosize: false
+output: 
+  ioslides_presentation:
+    incremental: no
+    keep_md: yes
+    smaller: no
+    
+---
+ 
+```{r overall-knitr-options, cache=FALSE, echo=FALSE, message=FALSE, warning=FALSE, results="hide"}
+library(knitr)
+opts_chunk$set(cache=FALSE, eval=TRUE, echo=FALSE, message=FALSE, warning=FALSE, results='asis')
+
+library(Biobase)
+library(data.table)
+library(ggplot2)
+library(gridExtra)
+library(limma)
+library(edgeR)
+library(DESeq2)
+library(xtable)
+library(GSEABase)
+library(DT)
+library(plyr)     ## join
+library(stringr)  ## str_trim
+library(plotly)
+library(cowplot)
+library(heatmap3)
+library(RUVSeq)
+
+DOFIT <- FALSE ## if TRUE run lmFit, otherwise read it from file.
+DOGSEA <- TRUE ## if FALSE read results from file
+QUIET <- TRUE
+ROOT <- "/shared/silo_researcher/Gottardo_R/cmurie_working/RTSS/RTSS_Full/"
+DOMDS <- FALSE
+FDRCut <- 0.2
+
+
+dat <- read.table( paste0(ROOT, "data/allData.txt"), sep="\t")
+anno <- read.csv( paste0(ROOT, "data/RTSSFullPheno.csv"))
+meta <- read.table(paste0(ROOT, "data/allMeta.txt"), sep="\t", header=TRUE, row.names=1)
+
+numberOfSubs <- length(unique(anno$SID))
+
+## get plate locations of controls
+controls <- setdiff(colnames(dat), anno$colID)
+
+## separate controls from biological samples
+conInd <- match(controls, colnames(dat))
+conDat <- dat[,conInd]
+bDat <- dat[,-conInd]
+meta <- meta[,-conInd]
+
+## make sure the phenotype and data files are ordered the same
+ordInd <- match( colnames(bDat), anno$colID)
+bPheno <- anno[ordInd,]
+if(sum(colnames(bDat) != bPheno$colID) != 0) {stop("ERROR: column names of data don't match annotation file")}
+if(sum(colnames(meta) != bPheno$colID) != 0) {stop("ERROR: column names of data don't match annotation file")}
+
+numSub <- ncol(bDat)
+
+ geneCut <- 20
+ sampCut <- 75000
+ pCut <- 0.01
+ FDRCut <- 0.2
+ 
+ ### remove low read samples
+ totReads <- apply(bDat, 2, sum)
+ dInd <- totReads <= sampCut
+ deletes <- sum(dInd)
+ dRan <- range(totReads[dInd])
+  
+ ## get idea of low to mid sample reads
+ mInd <- totReads > sampCut & totReads <= 300000
+ mids <- sum(mInd)
+ mRan <- range(totReads[mInd])
+ 
+  sampInd <- totReads > sampCut
+  totReadsF <- uRan <- range(totReads[sampInd])
+  fDat <- bDat[,sampInd]
+  uMeta <- meta[,sampInd]
+  
+ ## filter genes with low read counts. Gene needs at least 20 samples with reads >= 5
+ summ <- apply(fDat, 1, function(x) sum(x >= 5))
+ summInd <- summ > geneCut
+ 
+ ## before summing across technical replicates
+ numGenes <- apply(bDat, 2, function(x) sum(x!=0))
+ noZeros <- apply(bDat, 1, function(x) sum(x!=0))
+ 
+ uDat <- fDat[summInd,]
+ uPheno <- bPheno[sampInd,]
+ if(sum(colnames(uDat) != uPheno$colID) != 0) {stop("ERROR: column names of data don't match annotation file")}
+ 
+  ## get sample sizes by plate
+  dataP=bPheno[bPheno$site=="BAGAMOYO",c(2,4,5,7,8,9)]
+  total <- table(dataP$plate)
+  bagSampBeforeP<- cbind(total, table(dataP[,c(1,4)]), table(dataP[,c(1,3)]),
+                         table(dataP[,c(1,5)]),
+                         table(dataP[,c(1,6)])[,-1])
+  
+  dataP=uPheno[uPheno$site=="BAGAMOYO",c(2,4,5,7,8,9)]
+  total <- table(dataP$plate)
+  bagSampAfterP<- cbind(total, table(dataP[,c(1,4)]), table(dataP[,c(1,3)]),
+                         table(dataP[,c(1,5)]),
+                         table(dataP[,c(1,6)])[,-1])
+
+  dataP=bPheno[bPheno$site=="MANHICA",c(2,4,5,7,8,9)]
+  total <- table(dataP$plate)
+  manSampBeforeP<- cbind(total, table(dataP[,c(1,4)]), table(dataP[,c(1,3)]),
+                         table(dataP[,c(1,5)]),
+                         table(dataP[,c(1,6)])[,-1])
+ 
+   dataP=uPheno[uPheno$site=="MANHICA",c(2,4,5,7,8,9)]
+  total <- table(dataP$plate)
+  manSampAfterP<- cbind(total, table(dataP[,c(1,4)]), table(dataP[,c(1,3)]),
+                         table(dataP[,c(1,5)]),
+                         table(dataP[,c(1,6)])[,-1])
+  
+  bagSampRemoveP <- bagSampBeforeP - bagSampAfterP
+  manSampRemoveP <- manSampBeforeP - manSampAfterP
+ 
+   ## Before Filtering: get sample sizes of design by location and stimulation
+   data=bPheno[bPheno$site=="BAGAMOYO",c(4,5,7,8,9)]
+   total <- table(data$stim)
+   bagSampBefore <- cbind(total, table(data[,c(1,3)]), table(data[,c(1,2)]), table(data[,c(1,4)]),
+              table(data[,c(1,5)])[,-1])[c(3,2,4,1),]
+   data=bPheno[bPheno$site=="MANHICA",c(4,5,7,8,9)]
+   total <- table(data$stim)
+   manSampBefore <- cbind(total, table(data[,c(1,3)]), table(data[,c(1,2)]), table(data[,c(1,4)]),
+              table(data[,c(1,5)])[,-1])[c(3,2,4,1),]
+   
+   ## After Filtering: get sample sizes of design by location and stimulation
+   data=uPheno[uPheno$site=="BAGAMOYO",c(4,5,7,8,9)]
+   total <- table(data$stim)
+   bagSampAfter <- cbind(total, table(data[,c(1,3)]), table(data[,c(1,2)]), table(data[,c(1,4)]),
+              table(data[,c(1,5)])[,-1])[c(3,2,4,1),]
+   data=uPheno[uPheno$site=="MANHICA",c(4,5,7,8,9)]
+   total <- table(data$stim)
+   manSampAfter <- cbind(total, table(data[,c(1,3)]), table(data[,c(1,2)]), table(data[,c(1,4)]),
+              table(data[,c(1,5)])[,-1])[c(3,2,4,1),]
+   
+   ## Get table showing which samples were removed during filtering
+   bagSampRemove <- bagSampBefore - bagSampAfter
+   manSampRemove <- manSampBefore - manSampAfter
+   
+  ## set up factors, relevel, rename
+ uPheno$age <- factor(uPheno$agec, levels=unique(uPheno$agec), labels=c("old", "young"))
+ uPheno$age  <- relevel(uPheno$age, "young")
+ uPheno$agec <- NULL
+ uPheno$stimulation <- relevel(uPheno$stimulation, "dmso")
+ uPheno$vaccine <- relevel(uPheno$vaccine, "comparator")
+ uPheno$case <- uPheno$rna_seq_casecon.m12
+ uPheno$rna_seq_casecon.m12 <- NULL
+ uPheno$case <- relevel(uPheno$case, "control")
+ uPheno$match <- uPheno$rna_seq_match_id_m12
+ uPheno$rna_seq_match_id_m12 <- NULL
+ uPheno$TotalReads <- apply(uDat, 2, sum)
+ 
+  ## fit basic analysis for QA
+  myDes <- model.matrix(~stimulation*vaccine*age, data=uPheno)
+  eDat <- ExpressionSet(assayData=as.matrix(uDat))
+  normy <- calcNormFactors(eDat)
+  libNorm <- colSums(exprs(eDat))*normy
+   
+```
+
+
+## Experimental Design
+
+Bulk RNASeq experiment assessing the effect of different stimulation on subjects treated with the RTSS malaria vaccine or comparator. There were a total of `r ncol(bDat)` samples.
+
+**Subjects**: `r numberOfSubs` subjects.
+
+**Vaccine**: rtss and comparator
+
+**Stimulation**: dmso, csp, hbs
+
+**Location**: bagamoyo and manhica
+
+**Age**: 6-12 weeks (young) and 5-17 months (old).
+
+**Outcome**: control (no malaria) and case (malaria)
+
+**Visit**: M0 and M3 (initial visit and 3 months later)
+
+
+##Analysis
+
+Reads were aligned using BWA Aln version 0.7.10. The transcriptome was downloaded from
+UCSC RefSeq (Human 19 or Mouse 10). Mitochondrial genes and ERCC reference sequences were
+added. Sequence alignment and quantification were run at Broad Technology Labs. The data was voom transformed and a linear model was applied for statistical testing.
+
+Samples with total read counts less than `r as.integer(sampCut)` were removed. Genes that did not have at least `r geneCut` samples (approximately 10% of the sample size) with read counts greater than 5 were removed. 
+
+There were `r ncol(uDat)` samples and `r nrow(uDat)` genes remaining after filtering. 
+
+
+##Sample Sizes: before sample filtering {.smaller}
+
+There is a significant confound between age and location. Bagamoyo had samples only from the old age group and Manhica had mostly samples from the young age group.
+
+<table border = 1>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(bagSampBefore, caption="Bagamoyo", align=rep("p", 10), auto=TRUE), size="small", type = "html")
+```
+</td>
+</tr>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(manSampBefore, caption="Manhica", align=rep("p", 10), auto=TRUE), h.line=c(1:8), type = "html")
+```
+</td>
+</tr>
+</table>
+        
+
+##Sample Sizes: after sample filtering {.smaller}
+
+<table border = 1>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(bagSampAfter, caption="Bagamoyo", align=rep("p", 10)), type = "html")
+```
+</td>
+</tr>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(manSampAfter, caption="Manhica", align=rep("p", 10)), type = "html")
+```
+</td>
+</tr>
+</table>
+           
+       
+##Samples lost due to filtering {.smaller}
+
+There were a total of `r ncol(bDat) - ncol(uDat)` samples removed due to low read counts.
+
+The Manhica location had the majority of discarded samples, particularly for the 5-17m group, even though it had fewer samples than Bagamoyo and very few 5-17m samples.
+
+<table border = 1>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(bagSampRemove, caption="Bagamoyo", align=rep("p", 10)), type = "html")
+```
+</td>
+</tr>
+<tr>
+<td>
+```{r results='asis', echo=FALSE}
+   print(xtable(manSampRemove, caption="Manhica", align=rep("p", 10)), type = "html")
+```
+</td>
+</tr>
+</table>
+
+##Sample sizes by plate {.smaller}
+
+There are no significant confounds by plate. Factors of biological interest are relatively balanced across plates.
+
+```{r results='asis', echo=FALSE}
+   print(xtable(bagSampBeforeP, caption="Bagamoyo", align=rep("p", 10)), type = "html")
+```       
+
+```{r results='asis', echo=FALSE}
+   print(xtable(manSampBeforeP, caption="Manhica", align=rep("p", 10)), type = "html")
+```   
+   
+
+##Samples lost by filtering by plate {.smaller}
+
+The samples lost were mostly from Manhica and plate 3 in particular. 
+
+```{r results='asis', echo=FALSE}
+   print(xtable(bagSampRemoveP, caption="Bagamoyo", align=rep("p", 10)), type = "html")
+```       
+
+```{r results='asis', echo=FALSE}
+   print(xtable(manSampRemoveP, caption="Manhica", align=rep("p", 10)), type = "html")
+```
+
+   
+
+##Statistical Analysis {.smaller}
+
+- Compare interaction effects between stimulants vs controls and vaccine (rtss vs comparator)
+- Compare interaction effects between stimulants vs controls and disease (rtss vs comparator) separately for age groups (5-17m and 6-12w)
+- Compare interaction effects of stimulants vs dmso and case vs control for subjects treated with rtss,s (comparator samples left out)
+- Apply GSEA analysis (camera) to all comparisons using the Blood Transcriptional Modules (BTM)
+- Apply individual gene testing (DEGs) to all comparisons 
+- A Bayesian variance shrinkage estimator and the Benjamini-Hochberg FDR were applied.
+- An FDR cutoff of `r FDRCut` was used for significance.
+- Fold changes are calculated as stimulant - DMSO, rtss - comparator.
+
+
+```{r gsea, results="asis"}
+ 
+  ############################## GSEA analysis #####################################
+
+
+   btmFile <- "/shared/silo_researcher/Gottardo_R/10_ref_files/GMT/BTM_for_GSEA_20131008.gmt"
+   minGeneSetCut <- 5
+   
+    ## remove ama1 from study
+    amaInd <- uPheno$stimulation == "ama1"
+    uDat <- uDat[,!amaInd]
+    uPheno <- uPheno[!amaInd,]
+    libNorm <- libNorm[!amaInd]
+    uPheno$stimulation <- as.factor(as.character(uPheno$stimulation))
+    uPheno$stimulation <- relevel(uPheno$stimulation, "dmso")
+ 
+   
+   ## select only samples for M3 visit
+   mInd <- uPheno$visit == "M3"
+   uDat <- uDat[, mInd]
+   uPheno <- uPheno[mInd,]
+   libNorm <- libNorm[mInd]
+
+  ######################### run stim vaccine analysis #####################################
+   
+  ## both young and old groups
+  eDat <- ExpressionSet(assayData=as.matrix(uDat))
+  pData(eDat) <- uPheno
+  
+  ## only young groups
+  yInd <- uPheno$age=="young"
+  yPheno <- uPheno[yInd,]
+  ylibNorm <- libNorm[yInd]
+  yDat <- ExpressionSet(assayData=as.matrix(uDat[,yInd]))
+  pData(yDat) <- yPheno
+     
+  ## only old groups
+  oInd <- uPheno$age=="old"
+  oPheno <- uPheno[oInd,]
+  olibNorm <- libNorm[oInd]
+  oDat <- ExpressionSet(assayData=as.matrix(uDat[,oInd]))
+  pData(oDat) <- oPheno
+ 
+  myDes1 <- model.matrix(~plate + TotalReads + age + vaccine*stimulation, eDat)
+  myDesy <- model.matrix(~plate + TotalReads + vaccine*stimulation, yDat)
+  myDeso <- model.matrix(~plate + TotalReads + vaccine*stimulation, oDat)
+ 
+  v <- voom(exprs(eDat), design=myDes1, plot=FALSE, lib.size=libNorm)
+  vy <- voom(yDat, design=myDesy, plot=FALSE, lib.size=ylibNorm)
+  vo <- voom(oDat, design=myDeso, plot=FALSE, lib.size=olibNorm)
+ 
+  geneSet <- getGmt(btmFile)
+  geneIds <- geneIds(geneSet)
+  setsIndices <- ids2indices(geneIds, rownames(v$E))
+  setsIndices <- setsIndices[sapply(setsIndices, length) > minGeneSetCut]
+   
+  coefs <- colnames(myDes1)[9:12]
+  labs <- c("DMSO vs csp", "DMSO vs hbs", "DMSO vs csp:vaccine", "DMSO vs hbs:vaccine")
+  agey <- c("both", "young", "old")
+  
+  ## assemble various fits
+  allVoom <- list(v, vy, vo)
+  allModels <- list(myDes1, myDesy, myDeso)
+
+  if(DOGSEA) {
+      
+      ## apply GSEA to all models
+      allGDT <- list()
+      gMat <- NULL
+      for(i in 1:length(allVoom)) {
+          
+          ageLab <- agey[i]
+          v1 <- allVoom[[i]]
+          mod <- allModels[[i]]
+          
+          tmpMat <- NULL
+          coefInd <- 0
+          for(c in coefs) {
+            
+              coefInd <- coefInd +1
+              labb <- paste(labs[coefInd], ageLab, sep=": ")
+              res <- camera(v1, setsIndices, design=mod, contrast=c, sort=TRUE)
+              indo <- res$FDR <= FDRCut
+              tmpMat <- c(tmpMat, sum(indo))
+              
+              if(sum(indo) > 0) {
+                  allGDT[[labb]] <- cbind(res[indo, c("NGenes", "Direction")], 
+                                              signif(res[indo, c("PValue","FDR")], 3))
+              }
+              else {
+                allGDT[[labb]] <- -1
+              }
+              
+          } ## end for c
+             
+          ## collect summary statistics
+          gMat <- rbind(gMat, tmpMat)
+          
+      } ## end for i
+   
+       save(allGDT,  gMat, file=paste0(ROOT, "data/GSEAresLinNoAma.Rda"))
+    
+  } else {
+       load(file=paste0(ROOT, "data/GSEAresLinNoAma.Rda"))
+  }
+  
+  seqq <- c(1,5,9)
+  newOrder <- names(allGDT)[c(seqq, seqq+1, seqq+2, seqq+3)]
+  allGDT <- allGDT[newOrder]
+
+  ## only show summary of interactions
+  printGDT <- allGDT[7:12]
+  printTab <- gMat[,3:4]
+  dimnames(printTab) <- list(agey, c("csp", "hbs"))
+  
+ 
+  
+  ###################### run case/control analysis ####################################
+    
+   ## select only case or control for match
+   cInd <- (uPheno$case == "case" | uPheno$case == "control") & uPheno$vaccine=="rtss"
+   libNormc <- libNorm[cInd]
+   dDat <- uDat[,cInd]
+   dPheno <- uPheno[cInd,]
+   dPheno$case <- factor(dPheno$case, levels=c("control", "case"))
+      
+  ## both young and old groups
+  eDat <- ExpressionSet(assayData=as.matrix(dDat))
+  pData(eDat) <- dPheno
+  
+  ## only young groups
+  yInd <- dPheno$age=="young"
+  yPheno <- dPheno[yInd,]
+  ylibNorm <- libNormc[yInd]
+  yDat <- ExpressionSet(assayData=as.matrix(dDat[,yInd]))
+  pData(yDat) <- yPheno
+     
+  ## only old groups
+  oInd <- dPheno$age=="old"
+  oPheno <- dPheno[oInd,]
+  olibNorm <- libNormc[oInd]
+  oDat <- ExpressionSet(assayData=as.matrix(dDat[,oInd]))
+  pData(oDat) <- oPheno
+ 
+  myDes1c <- model.matrix(~plate + TotalReads + age + case*stimulation, eDat)
+  myDesyc <- model.matrix(~plate + TotalReads + case*stimulation, yDat)
+  myDesoc <- model.matrix(~plate + TotalReads + case*stimulation, oDat)
+ 
+  v <- voom(eDat, design=myDes1c, plot=FALSE, lib.size=libNormc)
+  vy <- voom(yDat, design=myDesyc, plot=FALSE, lib.size=ylibNorm)
+  vo <- voom(oDat, design=myDesoc, plot=FALSE, lib.size=olibNorm)
+ 
+  coefsc <- colnames(myDes1c)[9:12]
+  labsc <- c("DMSO vs csp", "DMSO vs hbs", "DMSO vs csp:disease", "DMSO vs hbs:disease")
+  agey <- c("both", "young", "old")
+  
+  ## assemble various fits
+  allVoomc <- list(v, vy, vo)
+  allModelsc <- list(myDes1c, myDesyc, myDesoc)
+  
+  ## apply GSEA to all models
+  allGDTc <- allSelect <- list()
+  gMatc <- NULL
+  for(i in 1:length(allVoomc)) {
+      
+      ageLab <- agey[i]
+      vc <- allVoomc[[i]]
+      mod <- allModelsc[[i]]
+      
+      tmpMat <- NULL
+      for(k in 1:length(coefsc)) {
+         
+          ## run camera on this comparison and data set
+          c <- coefsc[k]
+          labb <- paste(labsc[k], ageLab, sep=": ")
+          res <- camera(vc, setsIndices, design=mod, contrast=c, sort=TRUE)
+          indo <- res$FDR <= FDRCut
+          tmpMat <- c(tmpMat, sum(indo))
+          
+          if(sum(indo) > 0) {
+              allGDTc[[labb]] <- cbind(res[indo, c("NGenes", "Direction")], 
+                                          signif(res[indo, c("PValue","FDR")], 3))
+          } else {
+            allGDTc[[labb]] <- -1
+          }
+          
+          ## get index label for vaccine model
+          selectC <- coefs[k]
+          selectLab <-  paste(labs[k], ageLab, sep=": ")
+          selectDT <- allGDT[[selectLab]]
+          
+          ## get disease results for significant gene sets with vaccine model
+          if(length(selectDT) == 1) {
+             allSelect[[labb]] <- -1            
+          } else {
+             tmp2 <- cbind(res[rownames(selectDT), c("NGenes", "Direction")], 
+                          signif(res[rownames(selectDT), c("PValue","FDR")], 3))
+             
+             ## recalculate FDRs on just the previously selected gene sets
+             fdrs <- signif(p.adjust(tmp2$PValue, method="BH"), 3)
+             tmp2$FDR <- fdrs
+             tmp2 <- tmp2[order(tmp2$PValue),]
+             allSelect[[labb]] <- tmp2
+          }
+          
+      } ## end for c
+         
+      ## collect summary statistics
+      gMatc <- rbind(gMatc, tmpMat)
+      
+  } ## end for v
+
+  seqq <- c(1,5,9)
+  newOrder <- names(allGDTc)[c(seqq, seqq+1, seqq+2, seqq+3)]
+  allGDTc <- allGDTc[newOrder]
+  allSelect <- allSelect[newOrder]
+
+  ## only show summary of interactions
+  printGDTc <- allGDTc[7:12]
+  printSelect <- allSelect[7:12]
+  printTabc <- gMatc[,3:4]
+  dimnames(printTabc) <- list(agey, c("csp", "hbs"))
+  
+
+  ## generate output string for knit_child
+  outcase = NULL
+  for (i in 1:length(printGDT)) {
+    
+    ## vaccine model
+    knit_expanded <- paste0("##`r names(printGDT)[",i, "]` {.smaller}\n")
+    outcase = c(outcase, knit_expanded)
+    
+     if(is.null(dim(printGDT[[i]]))) {
+           knit_expanded <- "No significant gene sets found\n" 
+      }else {
+        knit_expanded <-  paste0("`r datatable(printGDT[[", i, "]])`\n")
+      }
+    outcase = c(outcase, knit_expanded)
+    
+    ## disease model for significant vaccine effects
+    knit_expanded <- paste0("##`r names(printSelect)[",i, "]`| disease model for significant vaccine effects {.smaller}")
+    outcase = c(outcase, knit_expanded)
+    
+     if(is.null(dim(printSelect[[i]]))) {
+           knit_expanded <- "No significant gene sets found\n" 
+      }else {
+        knit_expanded <-  paste0("`r datatable(printSelect[[", i, "]])`\n")
+      }
+    outcase = c(outcase, knit_expanded)
+    
+    ## disease model
+    knit_expanded <- paste0("##`r names(printGDTc)[",i, "]` {.smaller}\n")
+    outcase = c(outcase, knit_expanded)
+    
+     if(is.null(dim(printGDTc[[i]]))) {
+           knit_expanded <- "No significant gene sets found\n" 
+      }else {
+        knit_expanded <-  paste0("`r datatable(printGDTc[[", i, "]])`\n") 
+      }
+    outcase = c(outcase, knit_expanded)
+    
+  } ## end for i
+  
+  if(FALSE) {
+    
+  ## crudely calculate stim - dmso for each subject TODO - figure out how to do this with datatable
+  ##cInd <- uPheno$vaccine=="rtss" & (uPheno$case == "case" | uPheno$case=="control")
+  cInd <- rep(TRUE, nrow(uPheno))
+  vDatLogit <- deltaV$E[,cInd]
+  stims <- as.character(uPheno$stimulation)[cInd]
+  cases <- as.character(uPheno$case)[cInd]
+  ids <- as.character(uPheno$SID)[cInd]
+  ages <- as.character(uPheno$age)[cInd]
+  plates <- as.character(uPheno$plate)[cInd]
+  tReads <- as.numeric(uPheno$TotalReads)[cInd]
+  delta <- stimFac <- caseFac <- ageFac <- plateFac <- readFac <- NULL
+  for(s in unique(ids)) {
+     for(stim in c("ama1", "csp", "hbs")) {
+         indStim <- ids==s & stims==stim
+         indDMSO <- ids==s & stims=="dmso"
+         if(sum(indStim > 0) & sum(indDMSO > 0)) {
+             delta <- cbind(delta, vDatLogit[,indStim] - vDatLogit[,indDMSO])
+             stimFac <- c(stimFac, stim)
+             caseFac <- c(caseFac, cases[indStim])
+             ageFac <- c(ageFac, ages[indStim])
+             plateFac <- c(plateFac, plates[indStim])
+             readFac <- c(readFac, tReads[indStim])
+         } ## end for sum
+     } ## end for stim
+  } ## end for s
+  
+  
+  sigSet <- sigSetM81 <- "enriched in myeloid cells and monocytes (M81)"
+  sigGenes <- geneIds[[sigSet]]
+  
+  sigSet <- sigSetM32 <- "CORO1A-DEF6 network (I) (M32.2)"
+  sigGenes <- geneIds[[sigSet]]
+  
+  
+  ##stimInd <- stimFac=="hbs" ## M81 both
+  stimInd <- stimFac=="hbs" & ageFac=="old"  ## M81 old 
+  
+  sigDat <- delta[intersect(sigGenes, rownames(delta)), stimInd]
+  casey <- caseFac[stimInd]
+
+  sigDatCase <- sigDat[,casey=="case"]
+  sigDatCon <- sigDat[,casey=="control"]
+  mCase <- apply(sigDatCase, 2, mean)
+  mCon <- apply(sigDatCon, 2, mean)
+  sigDatAll <- cbind(sigDatCase[,order(mCase, decreasing=TRUE)], 
+                     sigDatCon[, order(mCon, decreasing=TRUE)])
+  caseAll <- matrix(c(rep(1, ncol(sigDatCase)), rep(2, ncol(sigDatCon))), ncol=1)
+  caseName <- matrix(c(rep("case", ncol(sigDatCase)), rep("control", ncol(sigDatCon))), ncol=1)
+  colnames(caseAll) <- "case"
+  
+  colnames(sigDatAll) <- caseName
+  dt <- melt(sigDatAll)
+  colnames(dt) <- c("gene", "disease", "expression")
+ 
+  dtm81both <- dt
+  dtm81old <- dt
+  dtm32old <- dt
+ 
+  ggplot(data=dt, aes(x=disease, y=expression)) + geom_boxplot(outlier.size = -1) + 
+    geom_jitter(alpha=0.2) + facet_wrap(~gene, scales= "free") +ggtitle(sigSetM81)
+
+  
+   pdf(file=paste(ROOT, "plots/boxPlotsDiseaseSig.pdf", sep=""))
+
+  ggplot(data=dtm81both, aes(x=disease, y=expression)) + geom_boxplot(outlier.size = -1) + 
+    geom_jitter(alpha=0.2) + facet_wrap(~gene, scales= "free") +ggtitle(sigSetM81)
+  ggplot(data=dtm81old, aes(x=disease, y=expression)) + geom_boxplot(outlier.size = -1) + 
+    geom_jitter(alpha=0.2) + facet_wrap(~gene, scales= "free") +ggtitle(sigSetM81)
+  ggplot(data=dtm32old, aes(x=disease, y=expression)) + geom_boxplot(outlier.size = -1) + 
+    geom_jitter(alpha=0.2) + facet_wrap(~gene, scales= "free") +ggtitle(sigSetM32)
+  
+   ggplot(data=dtm81both, aes(x=disease, y=expression)) + geom_violin(outlier.size = -1) + 
+    geom_jitter(alpha=0.2) + facet_wrap(~gene, scales= "free") +ggtitle(sigSetM81)
+  ggplot(data=dtm81old, aes(x=disease, y=expression)) + geom_violin(outlier.size = -1) + 
+    geom_jitter(alpha=0.2) + facet_wrap(~gene, scales= "free") +ggtitle(sigSetM81)
+  ggplot(data=dtm32old, aes(x=disease, y=expression)) + geom_violin(outlier.size = -1) + 
+    geom_jitter(alpha=0.2) + facet_wrap(~gene, scales= "free") +ggtitle(sigSetM32)
+  
+ dev.off()
+  
+ 
+ ## look at vaccine model
+  sigSet <- sigSetM81 <- "enriched in myeloid cells and monocytes (M81)"
+  sigGenes <- geneIds[[sigSet]]
+  
+  sigSet <- sigSetM32 <- "CORO1A-DEF6 network (I) (M32.2)"
+  sigGenes <- geneIds[[sigSet]]
+  
+  
+  ##stimInd <- stimFac=="hbs" ## M81 both
+  stimInd <- stimFac=="hbs" & ageFac=="old"  ## M81 old 
+  
+  sigDat <- delta[intersect(sigGenes, rownames(delta)), stimInd]
+  casey <- caseFac[stimInd]
+
+  sigDatCase <- sigDat[,casey=="case"]
+  sigDatCon <- sigDat[,casey=="control"]
+  mCase <- apply(sigDatCase, 2, mean)
+  mCon <- apply(sigDatCon, 2, mean)
+  sigDatAll <- cbind(sigDatCase[,order(mCase, decreasing=TRUE)], 
+                     sigDatCon[, order(mCon, decreasing=TRUE)])
+  caseAll <- matrix(c(rep(1, ncol(sigDatCase)), rep(2, ncol(sigDatCon))), ncol=1)
+  caseName <- matrix(c(rep("case", ncol(sigDatCase)), rep("control", ncol(sigDatCon))), ncol=1)
+  colnames(caseAll) <- "case"
+  
+  colnames(sigDatAll) <- caseName
+  dt <- melt(sigDatAll)
+  colnames(dt) <- c("gene", "disease", "expression")
+ 
+  dtm81both <- dt
+  dtm81old <- dt
+  dtm32old <- dt
+ 
+ 
+ 
+ 
+ 
+ 
+  pdf(file=paste(ROOT, "plots/heatMapsM81hbsOld.pdf", sep=""))
+  heatmap3(sigDatAll, Rowv=TRUE, Colv=NA, ColSideColors=caseAll, main=sigSet)
+  dev.off()
+  
+  for(n in 1:length(allGDTc)) {
+     namey <- names(allGDTc)[n]
+     tmp <- allGDTc[[n]]
+     if(length(tmp)==1) {
+        next()
+     }
+     stimm <- stimInd[n]
+     agey <- ageInd[n]
+     
+     for(i in rownames(tmp)) {
+        sigGenes <- geneIds[[i]]
+        if(n==1 | n==4 | n==7 | n==10) { ## use both age groups
+           sigDat <- delta[intersect(sigGenes, rownames(delta)), stimFac==stimm]
+           caseCol <-  matrix(as.numeric(as.factor(caseFac[stimFac==stimm])), ncol=1)
+        } else {                         ## use either young or old age groups
+           sigDat <- delta[intersect(sigGenes, rownames(delta)), stimFac==stimm & ageFac==agey]
+           caseCol <-  matrix(as.numeric(as.factor(caseFac[stimFac==stimm & ageFac==agey])), ncol=1)
+        }
+        colnames(caseCol) <- "case"
+        heatmap3(sigDat, Rowv=TRUE, Colv=TRUE, ColSideColors=caseCol, main=paste(namey, i, sep=": "))
+     } ## end for i
+     
+    
+  } ## end for n
+  dev.off()
+  } ## end if FALSE
+  
+```
+
+<!-- knit GSEA results--> 
+`r paste(knit_child(text = outcase), collapse = '\n')`
+
+
+
+##GSEA summary stimulation:vaccine interaction| FDR cutoff: `r FDRCut`
+
+Number of significant BTM gene sets for dmso versus stimulants and vaccine interaction.
+
+
+```{r results='asis', echo=FALSE}
+   print(xtable(printTab, align=rep("c", ncol(printTab)+1), auto=TRUE), type = "html")
+```
+
+
+##GSEA summary stimulation:disease interaction| FDR cutoff: `r FDRCut`
+
+Number of significant BTM gene sets for dmso versus stimulants and disease nteraction.
+
+
+```{r results='asis', echo=FALSE}
+   print(xtable(printTabc, align=rep("c", ncol(printTabc)+1), auto=TRUE), type = "html")
+```
+
+
+
+```{r voom, cache=FALSE}
+  
+   ####################### stimulation vaccine effects ################################
+
+  ## both young and old groups
+  eDat <- ExpressionSet(assayData=as.matrix(uDat))
+  pData(eDat) <- uPheno
+  
+  ## only young groups
+  yInd <- uPheno$age=="young"
+  yPheno <- uPheno[yInd,]
+  ylibNorm <- libNorm[yInd]
+  yDat <- ExpressionSet(assayData=as.matrix(uDat[,yInd]))
+  pData(yDat) <- yPheno
+     
+  ## only old groups
+  oInd <- uPheno$age=="old"
+  oPheno <- uPheno[oInd,]
+  olibNorm <- libNorm[oInd]
+  oDat <- ExpressionSet(assayData=as.matrix(uDat[,oInd]))
+  pData(oDat) <- oPheno
+ 
+  
+  myDes1 <- model.matrix(~plate + TotalReads + age + vaccine*stimulation, eDat)
+  myDesy <- model.matrix(~plate + TotalReads + vaccine*stimulation, yDat)
+  myDeso <- model.matrix(~plate + TotalReads + vaccine*stimulation, oDat)
+   
+  v <- voom(exprs(eDat), design=myDes1, plot=FALSE, lib.size=libNorm)
+  vy <- voom(yDat, design=myDesy, plot=FALSE, lib.size=ylibNorm)
+  vo <- voom(oDat, design=myDeso, plot=FALSE, lib.size=olibNorm)
+    
+  ## with the large matrix fitting the model takes 2-3 hrs. If it is already calculated
+  ## just read in the fitted model.
+  if(FALSE) {
+    
+      ## age == both model
+      system.time(ranCor <- duplicateCorrelation(v, design=myDes1,
+                                     block=uPheno$SID)$consensus.correlation)
+     fit1 <- lmFit(v, myDes1, block=uPheno$SID, correlation=ranCor)
+     save(fit1, ranCor, file=paste0(ROOT, "data/lmFitDataWithCoVarM3NoAMA.Rda"))
+     
+     ## run young age model
+     ranCorYoung <- duplicateCorrelation(vy, design=myDesy,
+                                     block=yPheno$SID)$consensus.correlation
+     fitYoung <- lmFit(vy, myDesy, block=yPheno$SID, correlation=ranCorYoung)
+     save(fitYoung, ranCorYoung, file=paste0(ROOT, "data/lmFitDataWithCoVarYoungNoAMA.Rda"))
+   
+     ## run old age model
+     ranCorOld <- duplicateCorrelation(vo, design=myDeso,
+                                     block=oPheno$SID)$consensus.correlation
+     fitOld <- lmFit(vo, myDeso, block=oPheno$SID, correlation=ranCorOld)
+     save(fitOld, ranCorOld, file=paste0(ROOT, "data/lmFitDataWithCoVarOldNoAMA.Rda"))
+     
+  } else {
+     load(file=paste0(ROOT, "data/lmFitDataWithCoVarM3NoAMA.Rda"))    ## load fit1
+     load(file=paste0(ROOT, "data/lmFitDataWithCoVarYoungNoAMA.Rda")) ## load fitYoung
+     load(file=paste0(ROOT, "data/lmFitDataWithCoVarOldNoAMA.Rda"))   ## load fitOld
+  }
+  
+  coefs <- colnames(myDes1)[9:12]
+  labs <- c("DMSO vs csp", "DMSO vs hbs", "DMSO vs csp:vaccine","DMSO vs hbs:vaccine")
+  agey <- c("both", "young", "old")
+  
+  
+  ## assemble various fits
+  allFit <- list(fit1, fitYoung, fitOld)
+  
+  ## extract data.tables and graphs from all fits
+  allDT <- allDEG <- allGraphs <- list()
+  ageInd <- 0
+  for(fit in allFit) {
+      
+      ## set age for this fit
+      ageInd <- ageInd + 1
+      ageLab <- agey[ageInd]
+      
+      ## shrinkage
+      fit2 <- eBayes(fit, trend=FALSE)
+    
+      ## cycle through coefficients
+      colInd <- c(1,4,5)
+      DEG <- NULL
+      coefInd <- 0
+      for(c in coefs) {
+           
+           coefInd <- coefInd+1
+           labb <- paste(labs[coefInd], ageLab, sep=": ")
+    
+           ## generate datatables
+           tmp <- topTable(fit2, number=Inf, coef=c, sort="P")
+           ##write.csv(tmp, file=paste0(ROOT, "data/", labs[i], "Result.csv"), row.names=TRUE)
+           indy <- tmp$P.Value <= pCut
+           tmpy <-  signif(tmp[indy, colInd], 3)
+           colnames(tmpy) <- c("log FC",  "P.value", "FDR")
+           allDT[[labb]] <- tmpy
+           DEG <- c(DEG, sum(tmpy$FDR <= FDRCut))
+   
+           ## generate graphs
+          graphSet <- list()
+          ress1 <- tmp
+          ress1$FDR <- ifelse(ress1$adj.P.Val > FDRCut, "NonSig", "Sig")   ## label significant genes
+          
+          graphSet[[1]] <- ggplot(ress1, aes(x=P.Value)) + geom_histogram(binwidth=.05) +
+            xlab("p-value") + ggtitle(label=labb) + theme_bw() + theme(aspect.ratio=1,
+                                                                       axis.text.x=element_text(size=10),
+                                                plot.title = element_text(size = 15)) + 
+            scale_x_continuous(breaks=c(0, 0.5, 1))
+          
+          graphSet[[2]] <- ggplot(ress1, aes(x=logFC, y=-log10(P.Value), color=FDR)) +
+            geom_point(shape=1) + ggtitle("logFC vs -log10 p-value") + theme_bw() + 
+            theme(axis.title.y=element_text(size=10), axis.text.x=element_text(size=6), 
+                  plot.title = element_text(size = 13)) + 
+            geom_vline(xintercept=c(-1,1), linetype="dashed", color="blue") + 
+          geom_hline(yintercept=-log10(c(0.01)), linetype="dashed", color="blue") +
+            theme(legend.position="none") +  scale_colour_manual(values=c("black", "red")) +
+            theme(aspect.ratio=1)
+          
+          graphSet[[3]] <- ggplot(ress1, aes(x=adj.P.Val)) + geom_histogram(binwidth=.05) +
+            xlab("p-value") + ggtitle("FDR") + theme_bw() + 
+            theme(aspect.ratio=1, plot.title = element_text(size = 15)) + 
+            scale_x_continuous(breaks=c(0, 0.5, 1))
+          
+          allGraphs[[labb]] <- graphSet
+      }
+      
+      ##allDT[[ageLab]] <- DT
+      ##allGraph[[ageLab]] <- graphs
+      allDEG <- rbind(allDEG, DEG)
+   
+  } ## end for fit
+  
+  ## reorder the lists for better presentation
+  seqq <- c(1,5,9)
+  newOrder <- names(allGraphs)[c(seqq, seqq+1, seqq+2, seqq+3)]
+  allGraphs <- allGraphs[newOrder]
+  allCompDT <- allDT
+  allDT <- allDT[newOrder]
+  
+  ## show only results for interactions
+  printGraphs <- allGraphs[7:12]
+  printDT <- allDT[7:12]
+  printDEGTab <- allDEG[,3:4]
+  dimnames(printDEGTab) <- list(agey, c("csp", "hbs"))
+
+  ##################### stimulation disease analysis ##################################
+  
+    ## both young and old groups
+  eDat <- ExpressionSet(assayData=as.matrix(dDat))
+  pData(eDat) <- dPheno
+  
+  ## only young groups
+  yInd <- dPheno$age=="young"
+  yPheno <- dPheno[yInd,]
+  ylibNorm <- libNormc[yInd]
+  yDat <- ExpressionSet(assayData=as.matrix(dDat[,yInd]))
+  pData(yDat) <- yPheno
+     
+  ## only old groups
+  oInd <- dPheno$age=="old"
+  oPheno <- dPheno[oInd,]
+  olibNorm <- libNormc[oInd]
+  oDat <- ExpressionSet(assayData=as.matrix(dDat[,oInd]))
+  pData(oDat) <- oPheno
+ 
+  myDes1c <- model.matrix(~plate + TotalReads + age + case*stimulation, eDat)
+  myDesyc <- model.matrix(~plate + TotalReads + case*stimulation, yDat)
+  myDesoc <- model.matrix(~plate + TotalReads + case*stimulation, oDat)
+ 
+  v <- voom(exprs(eDat), design=myDes1c, plot=FALSE, lib.size=libNormc)
+  vy <- voom(yDat, design=myDesyc, plot=FALSE, lib.size=ylibNorm)
+  vo <- voom(oDat, design=myDesoc, plot=FALSE, lib.size=olibNorm)
+ 
+  coefsc <- colnames(myDes1c)[9:12]
+  labsc <- c("DMSO vs csp", "DMSO vs hbs", "DMSO vs csp:disease", "DMSO vs hbs:disease")
+  agey <- c("both", "young", "old")
+  
+  if(FALSE) {
+    
+      ## age == both model
+      ranCorc <- duplicateCorrelation(v, design=myDes1c,
+                                     block=dPheno$SID)$consensus.correlation
+      fit1c <- lmFit(v, myDes1c, block=dPheno$SID, correlation=ranCorc)
+      save(fit1c, ranCorc, file=paste0(ROOT, "data/lmFitDataWithCoVarM3caseNoAMA.Rda"))
+     
+     ## run young age model
+     ranCorYoungc <- duplicateCorrelation(vy, design=myDesyc,
+                                     block=yPheno$SID)$consensus.correlation
+     fitYoungc <- lmFit(vy, myDesyc, block=yPheno$SID, correlation=ranCorYoungc)
+     save(fitYoungc, ranCorYoungc, file=paste0(ROOT, "data/lmFitDataWithCoVarYoungcaseNoAMA.Rda"))
+    
+     ## run old age model
+     ranCorOldc <- duplicateCorrelation(vo, design=myDesoc,
+                                     block=oPheno$SID)$consensus.correlation
+     fitOldc <- lmFit(vo, myDesoc, block=oPheno$SID, correlation=ranCorOldc)
+     save(fitOldc, ranCorOldc, file=paste0(ROOT, "data/lmFitDataWithCoVarOldcaseNoAMA.Rda"))
+     
+  } else {
+     load(file=paste0(ROOT, "data/lmFitDataWithCoVarM3caseNoAMA.Rda"))    ## load fit1
+     load(file=paste0(ROOT, "data/lmFitDataWithCoVarYoungcaseNoAMA.Rda")) ## load fitYoung
+     load(file=paste0(ROOT, "data/lmFitDataWithCoVarOldcaseNoAMA.Rda"))   ## load fitOld
+  } ## end if FALSE
+  
+   ## assemble various fits
+   allFitc <- list(fit1c, fitYoungc, fitOldc)
+  
+  ## extract data.tables and graphs from all fits
+  allDTc <- allDEGc <- allGraphsc <- selectDEG <- list()
+  ageInd <- 0
+  for(fit in allFitc) {
+      
+      ## set age for this fit
+      ageInd <- ageInd + 1
+      ageLab <- agey[ageInd]
+      
+      ## shrinkage
+      fit2 <- eBayes(fit, trend=FALSE)
+    
+      ## cycle through coefficients
+      colInd <- c(1,4,5)
+      DEG <- NULL
+      for(i in 1:length(coefsc)) {
+           
+           c <- coefsc[i]
+           labb <- paste(labsc[i], ageLab, sep=": ")
+    
+           ## generate datatables
+           tmp <- topTable(fit2, number=Inf, coef=c, sort="P")
+           ##write.csv(tmp, file=paste0(ROOT, "data/", labs[i], "Result.csv"), row.names=TRUE)
+           indy <- tmp$P.Value <= pCut
+           tmpy <-  signif(tmp[indy, colInd], 3)
+           colnames(tmpy) <- c("log FC",  "P.value", "FDR")
+           allDTc[[labb]] <- tmpy
+           DEG <- c(DEG, sum(tmpy$FDR <= FDRCut))
+   
+           ## generate graphs
+          graphSet <- list()
+          ress1 <- tmp
+          ress1$FDR <- ifelse(ress1$adj.P.Val > FDRCut, "NonSig", "Sig")   ## label significant genes
+          
+          graphSet[[1]] <- ggplot(ress1, aes(x=P.Value)) + geom_histogram(binwidth=.05) +
+            xlab("p-value") + ggtitle(label=labb) + theme_bw() + theme(aspect.ratio=1,
+                                                                       axis.text.x=element_text(size=10),
+                                                plot.title = element_text(size = 15)) + 
+            scale_x_continuous(breaks=c(0, 0.5, 1))
+          
+          graphSet[[2]] <- ggplot(ress1, aes(x=logFC, y=-log10(P.Value), color=FDR)) +
+            geom_point(shape=1) + ggtitle("logFC vs -log10 p-value") + theme_bw() + 
+            theme(axis.title.y=element_text(size=10), axis.text.x=element_text(size=6), 
+                  plot.title = element_text(size = 13)) + 
+            geom_vline(xintercept=c(-1,1), linetype="dashed", color="blue") + 
+          geom_hline(yintercept=-log10(c(0.01)), linetype="dashed", color="blue") +
+            theme(legend.position="none") +  scale_colour_manual(values=c("black", "red")) +
+            theme(aspect.ratio=1)
+          
+          graphSet[[3]] <- ggplot(ress1, aes(x=adj.P.Val)) + geom_histogram(binwidth=.05) +
+            xlab("p-value") + ggtitle("FDR") + theme_bw() + 
+            theme(aspect.ratio=1, plot.title = element_text(size = 15)) + 
+            scale_x_continuous(breaks=c(0, 0.5, 1))
+          
+          allGraphsc[[labb]] <- graphSet
+          
+          ## get index label for vaccine model
+          selectDEGC <- coefs[i]
+          selectDEGLab <-  paste(labs[i], ageLab, sep=": ")
+          selectDEGDT <- allCompDT[[selectDEGLab]]
+          
+          ## get disease results for significant gene sets with vaccine model
+          if(is.null(dim(selectDEGDT))) {
+             selectDEG[[labb]] <- -1            
+          } else {
+              tmp2 <-  signif(tmp[rownames(selectDEGDT),colInd], 3)
+              
+              ## recalculate FDRS for just the previously selected genes
+              fdrs <- p.adjust(tmp2$P.Value, method="BH")
+              tmp2$adj.P.Val <- fdrs
+              tmp2 <- tmp2[order(tmp2$P.Value),]
+              selectDEG[[labb]] <- tmp2
+          }
+    
+      }
+    
+      allDEGc <- rbind(allDEGc, DEG)
+   
+  } ## end for fit
+  
+  ## reorder the lists for better presentation
+  seqq <- c(1,5,9)
+  newOrder <- names(allGraphsc)[c(seqq, seqq+1, seqq+2, seqq+3)]
+  allGraphsc <- allGraphsc[newOrder]
+  allDTc <- allDTc[newOrder]
+  selectDEG <- selectDEG[newOrder]
+  
+  ## show only results for interactions
+  printGraphsc <- allGraphsc[7:12]
+  printDTc <- allDTc[7:12]
+  printSelectDEG <- selectDEG[7:12]
+  printDEGTabc <- allDEGc[,3:4]
+  dimnames(printDEGTabc) <- list(agey, c("csp", "hbs"))
+    
+  ## assemble output in string format for knit_child  
+  outCaseDEGc = NULL
+  for (i in 1:length(printGraphsc)) {
+    
+      ## vaccine model
+      outCaseDEGc <- c(outCaseDEGc,  paste0("##`r names(printDT)[",i, "]` \n"))
+      outCaseDEGc <- c(outCaseDEGc,  paste0("```{r results='asis', echo=FALSE}\ngrid.arrange(printGraphs[[", i, "]][[1]], printGraphs[[", i, "]][[2]], printGraphs[[", i, "]][[3]], nrow=1, ncol=3)\n```\n"))
+    
+      outCaseDEGc <- c(outCaseDEGc,  paste0("##`r names(printDT)[",i, "]` {.smaller}\n"))
+     if(is.null(dim(printDT[[i]]))) {
+           knit_expanded <- paste0("No significant genes found\n\n <br>") 
+      }else {
+        knit_expanded <- paste0("```{r results='asis', echo=FALSE}\n\ndatatable(printDT[[", i, "]])\n\n```\n")
+      }
+      outCaseDEGc <-  c(outCaseDEGc, knit_expanded)
+    
+      ## disease model for significant genes from vaccine model
+       outCaseDEGc <- c(outCaseDEGc,  paste0("##`r names(printDTc)[",i, "]`| disease model for significant vaccine effects {.smaller}\n"))
+       if(is.null(dim(printSelectDEG[[i]]))) {
+           knit_expanded <- paste0("No significant genes found\n\n <br>") 
+      }else {
+        knit_expanded <- paste0("```{r results='asis', echo=FALSE}\n\ndatatable(printSelectDEG[[", i, "]])\n\n```\n")
+      }
+     outCaseDEGc = c(outCaseDEGc, knit_expanded)
+      
+      ## disease model
+     outCaseDEGc <- c(outCaseDEGc,  paste0("##`r names(printDTc)[",i, "]` \n"))
+     outCaseDEGc <- c(outCaseDEGc,  paste0("```{r results='asis', echo=FALSE}\ngrid.arrange(printGraphsc[[", i, "]][[1]], printGraphsc[[", i, "]][[2]], printGraphsc[[", i, "]][[3]], nrow=1, ncol=3)\n```\n"))
+    
+     outCaseDEGc <- c(outCaseDEGc,  paste0("##`r names(printDTc)[",i, "]` {.smaller}\n"))
+     if(is.null(dim(printDTc[[i]]))) {
+           knit_expanded <- paste0("No significant genes found\n\n <br>") 
+      }else {
+        knit_expanded <- paste0("```{r results='asis', echo=FALSE}\n\ndatatable(printDTc[[", i, "]])\n\n```\n")
+      }
+     outCaseDEGc = c(outCaseDEGc, knit_expanded)
+  } ## end for i
+  
+  ##<!--Output DEG results results-->
+  ##<!--`r paste(knit_child(text = outCaseDEGc), collapse = '\n')` -->
+
+
+  
+```
+
+<!--Output DEG results results-->
+`r paste(knit_child(text = outCaseDEGc), collapse = '\n')`
+
+##DEG summary stimulation vaccine interaction | FDR cutoff: `r FDRCut`
+
+Number of significant genes for dmso versus stimulants and vaccine interaction.
+
+```{r results='asis', echo=FALSE}
+   print(xtable(printDEGTab, align=rep("c", ncol(printDEGTab)+1), auto=TRUE), type = "html")
+```
+
+##DEG summary stimulation disease interaction | FDR cutoff: `r FDRCut`
+
+Number of significant genes for dmso versus stimulants and vaccine interaction.
+
+```{r results='asis', echo=FALSE}
+   print(xtable(printDEGTabc, align=rep("c", ncol(printDEGTabc)+1), auto=TRUE), type = "html")
+```
+
+
+
+  
