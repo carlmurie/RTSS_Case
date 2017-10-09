@@ -22,23 +22,17 @@ library(ggplot2)
 library(gridExtra)
 library(limma)
 library(edgeR)
-library(DESeq2)
 library(xtable)
 library(GSEABase)
 library(DT)
 library(plyr)     ## join
 library(stringr)  ## str_trim
-library(plotly)
-library(cowplot)
 library(heatmap3)
-library(RUVSeq)
 
 DOFIT <- FALSE ## if TRUE run lmFit, otherwise read it from file.
 DOGSEA <- TRUE ## if FALSE read results from file
 QUIET <- TRUE
 ROOT <- "/shared/silo_researcher/Gottardo_R/cmurie_working/RTSS/RTSS_Full/"
-DOMDS <- FALSE
-FDRCut <- 0.2
 
 
 dat <- read.table( paste0(ROOT, "data/allData.txt"), sep="\t")
@@ -355,7 +349,7 @@ The samples lost were mostly from Manhica and plate 3 in particular.
   v <- voom(exprs(eDat), design=myDes1, plot=FALSE, lib.size=libNorm)
   vy <- voom(yDat, design=myDesy, plot=FALSE, lib.size=ylibNorm)
   vo <- voom(oDat, design=myDeso, plot=FALSE, lib.size=olibNorm)
- 
+
   geneSet <- getGmt(btmFile)
   geneIds <- geneIds(geneSet)
   setsIndices <- ids2indices(geneIds, rownames(v$E))
@@ -457,6 +451,8 @@ The samples lost were mostly from Manhica and plate 3 in particular.
   vy <- voom(yDat, design=myDesyc, plot=FALSE, lib.size=ylibNorm)
   vo <- voom(oDat, design=myDesoc, plot=FALSE, lib.size=olibNorm)
  
+  deltaV <- v
+  
   coefsc <- colnames(myDes1c)[9:12]
   labsc <- c("DMSO vs csp", "DMSO vs hbs", "DMSO vs csp:disease", "DMSO vs hbs:disease")
   agey <- c("both", "young", "old")
@@ -510,7 +506,7 @@ The samples lost were mostly from Manhica and plate 3 in particular.
              allSelect[[labb]] <- tmp2
           }
           
-      } ## end for c
+      } ## end for k
          
       ## collect summary statistics
       gMatc <- rbind(gMatc, tmpMat)
@@ -568,69 +564,197 @@ The samples lost were mostly from Manhica and plate 3 in particular.
     
   } ## end for i
   
+  
+  
+  ##################################################################################
+  ## code to calculate deltas and provide some specific graphs. Not part of report.
+  ###################################################################################
   if(FALSE) {
     
   ## crudely calculate stim - dmso for each subject TODO - figure out how to do this with datatable
-  ##cInd <- uPheno$vaccine=="rtss" & (uPheno$case == "case" | uPheno$case=="control")
-  cInd <- rep(TRUE, nrow(uPheno))
-  vDatLogit <- deltaV$E[,cInd]
-  stims <- as.character(uPheno$stimulation)[cInd]
-  cases <- as.character(uPheno$case)[cInd]
-  ids <- as.character(uPheno$SID)[cInd]
-  ages <- as.character(uPheno$age)[cInd]
-  plates <- as.character(uPheno$plate)[cInd]
-  tReads <- as.numeric(uPheno$TotalReads)[cInd]
-  delta <- stimFac <- caseFac <- ageFac <- plateFac <- readFac <- NULL
-  for(s in unique(ids)) {
-     for(stim in c("ama1", "csp", "hbs")) {
-         indStim <- ids==s & stims==stim
-         indDMSO <- ids==s & stims=="dmso"
-         if(sum(indStim > 0) & sum(indDMSO > 0)) {
-             delta <- cbind(delta, vDatLogit[,indStim] - vDatLogit[,indDMSO])
+  pheno <- deltaPheno## eDat generated in line 331-334 (only M3 and no ama1)
+  ##dat <- exprs(eDat)
+  dat <- deltaV$E
+  
+  
+  
+  delta <- stimFac <- caseFac <- ageFac <- vaccineFac <- NULL
+  for(s in unique(pheno$SID)) {
+     for(stim in c("csp", "hbs")) {
+         indStim <- pheno$SID==s & pheno$stimulation==stim
+         indDMSO <- pheno$SID==s & pheno$stimulation=="dmso"
+         if(sum(indStim == 1) & sum(indDMSO == 1)) {
+             if(pheno$case[indStim] != pheno$case[indDMSO]) {stop("ERROR case")}
+             if(pheno$age[indStim] != pheno$age[indDMSO]) {stop("ERROR age")}
+             delta <- cbind(delta, dat[,indStim] - dat[,indDMSO])
              stimFac <- c(stimFac, stim)
-             caseFac <- c(caseFac, cases[indStim])
-             ageFac <- c(ageFac, ages[indStim])
-             plateFac <- c(plateFac, plates[indStim])
-             readFac <- c(readFac, tReads[indStim])
+             caseFac <- c(caseFac, as.character(pheno$case[indStim]))
+             ageFac <- c(ageFac, as.character(pheno$age[indStim]))
+             vaccineFac <- c(vaccineFac, as.character(pheno$vaccine[indStim]))
          } ## end for sum
      } ## end for stim
   } ## end for s
   
+  ### vaccine model
   
-  sigSet <- sigSetM81 <- "enriched in myeloid cells and monocytes (M81)"
-  sigGenes <- geneIds[[sigSet]]
-  
-  sigSet <- sigSetM32 <- "CORO1A-DEF6 network (I) (M32.2)"
-  sigGenes <- geneIds[[sigSet]]
-  
-  
-  ##stimInd <- stimFac=="hbs" ## M81 both
-  stimInd <- stimFac=="hbs" & ageFac=="old"  ## M81 old 
-  
-  sigDat <- delta[intersect(sigGenes, rownames(delta)), stimInd]
-  casey <- caseFac[stimInd]
-
-  sigDatCase <- sigDat[,casey=="case"]
-  sigDatCon <- sigDat[,casey=="control"]
-  mCase <- apply(sigDatCase, 2, mean)
-  mCon <- apply(sigDatCon, 2, mean)
-  sigDatAll <- cbind(sigDatCase[,order(mCase, decreasing=TRUE)], 
-                     sigDatCon[, order(mCon, decreasing=TRUE)])
-  caseAll <- matrix(c(rep(1, ncol(sigDatCase)), rep(2, ncol(sigDatCon))), ncol=1)
-  caseName <- matrix(c(rep("case", ncol(sigDatCase)), rep("control", ncol(sigDatCon))), ncol=1)
-  colnames(caseAll) <- "case"
-  
-  colnames(sigDatAll) <- caseName
-  dt <- melt(sigDatAll)
-  colnames(dt) <- c("gene", "disease", "expression")
+  vLabs <- c("DMSO vs csp:vaccine: both", "DMSO vs hbs:vaccine: both")
+  vaccineFac[vaccineFac=="comparator"] <- "comp"
+  vaccineFac <- factor(vaccineFac, levels=c("rtss", "comp"))
+  ageFac <- factor(ageFac, levels=c("young", "old"))  
  
-  dtm81both <- dt
-  dtm81old <- dt
-  dtm32old <- dt
+  ncolDat <- rbind(c(6,4), c(6,3), c(6,4), c(4,3), c(6,4), c(6,3), c(4,3))
  
-  ggplot(data=dt, aes(x=disease, y=expression)) + geom_boxplot(outlier.size = -1) + 
-    geom_jitter(alpha=0.2) + facet_wrap(~gene, scales= "free") +ggtitle(sigSetM81)
+  ggPlotListV <- list()
+  for(set in rownames(allGDT[[vLabs[2]]])) {
 
+     sigGenes <- geneIds[[set]]  ## get gene symbols for this set
+     sigDat <- delta[intersect(sigGenes, rownames(delta)),]
+   
+     ## look at means of each level out of interest
+     mRTSS <- apply(sigDat[,vaccineFac=="rtss"], 2, mean)
+     mComp <- apply(sigDat[,vaccineFac=="comp"], 2, mean)
+     print(allGDT[[vLabs[2]]][set,])
+     print(mean(mRTSS) - mean(mComp))
+  
+     ## melt age factor  
+     colnames(sigDat) <- ageFac
+     dt1 <- melt(sigDat)
+ 
+     ## melt case factor  ? is there a better way to melt the two factors ?
+     colnames(sigDat) <- vaccineFac
+     dt <- melt(sigDat)
+     colnames(dt) <- c("gene", "vaccine", "expression")
+     dt$age <- factor(dt1$Var2, levels=c("young", "old"), ordered=TRUE)
+  
+     ggPlotListV[[set]] <- ggplot(data=dt, aes(x=vaccine, y=expression)) + 
+                                 geom_boxplot(outlier.size=-1) +
+       geom_point(aes(color=age),position=position_jitterdodge(), alpha=0.2, size=0.3) +
+        facet_wrap(~gene, scales= "free", ncol=6) + ggtitle(set) +theme(aspect.ratio=1)
+    
+  } ## end for set
+  
+  pdf(file=paste(ROOT, "plots/boxPlotsVaccineHBS.pdf", sep=""))
+  print(ggPlotListV[[1]]) 
+  print(ggPlotListV[[2]]) 
+  print(ggPlotListV[[3]])
+  print(ggPlotListV[[4]])
+  print(ggPlotListV[[5]])
+  print(ggPlotListV[[6]])
+  print(ggPlotListV[[7]])
+  dev.off() 
+  
+ 
+
+  #### disease model
+  dInd <- (caseFac == "case" | caseFac == "control") & vaccineFac=="rtss" & stimFac=="hbs"
+  deltaCase <- delta[,dInd]
+  caseCase <- caseFac[dInd]
+  ageCase <- ageFac[dInd]
+  stimCase <- stimFac[dInd]
+
+  ## shorten control level for graph
+  caseCase[caseCase=="control"] <- "con"
+  
+  ncolDat <- rbind(c(6,4), c(3,3), c(6,4))
+  
+  ## comparisons of interest (allGDTc) only second comparison has significant results
+  comps <- c("DMSO vs csp:disease: both", "DMSO vs hbs:disease: both")
+  
+  ggPlotList <- list()
+  colInd <- 0
+  for(set in rownames(allGDTc[[comps[2]]])) {
+
+     colInd <- colInd + 1
+     sigGenes <- geneIds[[set]]  ## get gene symbols for this set
+     sigDat <- deltaCase[intersect(sigGenes, rownames(deltaCase)),]
+   
+     ## look at means of each level out of interest
+     mCase <- apply(sigDat[,caseCase=="case"], 2, mean)
+     mCon <- apply(sigDat[,caseCase=="control"], 2, mean)
+     ##print(mean(mCase) - mean(mCon))
+  
+     ## melt age factor  
+     colnames(sigDat) <- ageCase
+     dt1 <- melt(sigDat)
+ 
+     ## melt case factor  ? is there a better way to melt the two factors ?
+     colnames(sigDat) <- caseCase
+     dt <- melt(sigDat)
+     colnames(dt) <- c("gene", "disease", "expression")
+     dt$age <- factor(dt1$Var2, levels=c("young", "old"), ordered=TRUE)
+     dt$disease <- factor(dt$disease, levels=c("case", "con"), ordered=TRUE)
+ 
+     ggPlotList[[set]] <- ggplot(data=dt, aes(x=disease, y=expression)) + 
+                                 geom_boxplot(outlier.size=-1) +
+       geom_point(aes(color=age),position=position_jitterdodge(), alpha=0.4, size=0.65) +
+        ##facet_wrap(~gene, scales= "free", ncol=ncolDat[colInd,1], nrow=ncolDat[colInd,2]) +
+        facet_wrap(~gene, scales= "free", ncol=6, nrow=4) +
+       ggtitle(set) + theme(aspect.ratio = 1)
+    
+  } ## end for set
+  
+ 
+  
+  pdf(file=paste(ROOT, "plots/boxPlotsDiseaseHBS.pdf", sep=""))
+  print(ggPlotList[[1]]) 
+  print(ggPlotList[[2]]) 
+  print(ggPlotList[[3]])
+  dev.off() 
+  
+  
+  #### disease model csp
+  dIndh <- (caseFac == "case" | caseFac == "control") & vaccineFac=="rtss" & stimFac=="csp"
+  deltaCaseh <- delta[,dIndh]
+  caseCaseh <- caseFac[dIndh]
+  ageCaseh <- ageFac[dIndh]
+  stimCaseh <- stimFac[dIndh]
+
+  
+  ## put IL2 plots together
+  
+  ILvac <- delta["IL2",]
+  ILVacdf <- data.frame(expression=ILvac, vaccine=vaccineFac, age=ageFac, stim=stimFac)
+  ILVaccsp <- ILVacdf[stimFac=="csp",]
+  ILVachbs <- ILVacdf[stimFac=="hbs",]
+ 
+  
+  ## hbs
+  ILdis <- deltaCase["IL2",]
+  ILDisdf <- data.frame(expression=ILdis, disease=caseCase, age=ageCase, stim=stimCase)
+  ILDisdf$disease <- factor(ILDisdf$disease, levels=c("control", "case"))
+
+  ## csp
+  ILdish <- deltaCaseh["IL2",]
+  ILDisdfh <- data.frame(expression=ILdish, disease=caseCaseh, age=ageCaseh, stim=stimCaseh)
+  ILDisdfh$disease <- factor(ILDisdfh$disease, levels=c("control", "case"))
+
+  
+  ## csp plots
+  ggplot(data=ILVaccsp, aes(x=vaccine, y=expression)) + 
+                                 geom_boxplot(outlier.size=-1) +
+       geom_point(aes(color=age),position=position_jitterdodge(), alpha=1, size=1) +
+       ggtitle("IL2: vaccine model")
+    
+  ggplot(data=ILDisdfh, aes(x=disease, y=expression)) + 
+                                 geom_boxplot(outlier.size=-1) +
+       geom_point(aes(color=age),position=position_jitterdodge(), alpha=1, size=1) +
+       ggtitle("IL2: disease model")
+
+  
+  
+  ## hbs plots
+  pdf(file=paste0(ROOT, "plots/boxPlotsIL2.pdf"))
+  ggplot(data=ILVachbs, aes(x=vaccine, y=expression)) + 
+                                 geom_boxplot(outlier.size=-1) +
+       geom_point(aes(color=age),position=position_jitterdodge(), alpha=1, size=1) +
+       ggtitle("IL2: vaccine model")
+    
+  ggplot(data=ILDisdf, aes(x=disease, y=expression)) + 
+                                 geom_boxplot(outlier.size=-1) +
+       geom_point(aes(color=age),position=position_jitterdodge(), alpha=1, size=1) +
+       ggtitle("IL2: disease model")
+  dev.off() 
+  
   
    pdf(file=paste(ROOT, "plots/boxPlotsDiseaseSig.pdf", sep=""))
 
@@ -718,6 +842,9 @@ The samples lost were mostly from Manhica and plate 3 in particular.
   } ## end for n
   dev.off()
   } ## end if FALSE
+  ###################################################################################
+  ################# end of delta section ############################################
+  ###################################################################################
   
 ```
 
@@ -1021,7 +1148,7 @@ Number of significant BTM gene sets for dmso versus stimulants and disease ntera
               
               ## recalculate FDRS for just the previously selected genes
               fdrs <- p.adjust(tmp2$P.Value, method="BH")
-              tmp2$adj.P.Val <- fdrs
+              tmp2$adj.P.Val <- signif(fdrs, 3)
               tmp2 <- tmp2[order(tmp2$P.Value),]
               selectDEG[[labb]] <- tmp2
           }
@@ -1110,6 +1237,10 @@ Number of significant genes for dmso versus stimulants and vaccine interaction.
    print(xtable(printDEGTabc, align=rep("c", ncol(printDEGTabc)+1), auto=TRUE), type = "html")
 ```
 
+##SessionInfo{.samller}
+```{r sessionInfo}
 
-
+  ## generate version information
+   sessionInfo()
+```
   
